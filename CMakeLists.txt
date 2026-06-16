@@ -33,12 +33,13 @@ set(GGML_LLAMAFILE ${DA_GGML_LLAMAFILE} CACHE BOOL "" FORCE)
 set(GGML_CUDA   ${DA_GGML_CUDA}   CACHE BOOL "" FORCE)
 set(GGML_METAL  ${DA_GGML_METAL}  CACHE BOOL "" FORCE)
 set(GGML_VULKAN ${DA_GGML_VULKAN} CACHE BOOL "" FORCE)
-# CUDA-only: if the user did not pin target arch(s), default to "native" so the
-# build targets the GPU on the build host (e.g. the GB10/Blackwell DGX). Guarded
-# behind DA_GGML_CUDA so a CPU-only build never touches CUDA settings.
-if(DA_GGML_CUDA AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA target architecture(s)")
-endif()
+# CUDA target arch is left to ggml's own ggml-cuda/CMakeLists, which picks a
+# sensible default (a virtual-arch list covering Maxwell..Blackwell, incl.
+# 120a/121a-real for GB10) when CMAKE_CUDA_ARCHITECTURES is unset, and guards
+# against a GPU-less builder. Do NOT force "native" here: it needs CMake >= 3.24
+# and a GPU present at configure time, so it breaks cross/CI builds (e.g. the
+# l4t/Jetson image on CMake 3.22 yields an empty "compute_" arch). For a local
+# GPU-targeted build pass -DCMAKE_CUDA_ARCHITECTURES=native explicitly.
 add_subdirectory(third_party/ggml EXCLUDE_FROM_ALL)
 
 set(DA_SOURCES
