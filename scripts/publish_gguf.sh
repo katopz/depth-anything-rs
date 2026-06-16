@@ -37,8 +37,7 @@ command -v hf >/dev/null 2>&1 || { echo "error: 'hf' CLI not found — pip insta
 echo ">> Verifying checksums in $MODELS_DIR against SHA256SUMS ..."
 ( cd "$MODELS_DIR" && sha256sum -c SHA256SUMS )
 
-# Files actually referenced by the gallery (skip the large nested pair until the
-# backend serves metric depth). Edit this list to publish more/fewer.
+# Files published to the GGUF repo. Edit this list to publish more/fewer.
 FILES=(
   depth-anything-base-q4_k.gguf
   depth-anything-base-q8_0.gguf
@@ -48,10 +47,20 @@ FILES=(
   depth-anything-large-f32.gguf
   depth-anything-giant-f32.gguf
   depth-anything-mono-large-f32.gguf
+  depth-anything-metric-large-f32.gguf
+  depth-anything-nested-anyview.gguf
+  depth-anything-nested-metric.gguf
 )
 
 echo ">> Ensuring repo $HF_REPO exists ..."
 hf repo create "$HF_REPO" --repo-type model -y >/dev/null 2>&1 || true
+
+# Upload the model card (MODEL_CARD.md -> README.md on the repo) if present.
+CARD="${MODELS_DIR}/MODEL_CARD.md"
+if [ -f "$CARD" ]; then
+  echo ">> Uploading model card -> $HF_REPO/README.md ..."
+  hf upload "$HF_REPO" "$CARD" README.md --repo-type model
+fi
 
 for f in "${FILES[@]}"; do
   path="${MODELS_DIR}/${f}"
