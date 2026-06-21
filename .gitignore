@@ -12,3 +12,12 @@ __pycache__/
 
 # recorder intermediate outputs
 /out/
+
+# Rust build artifacts
+/target/
+*.rs.bk
+.env
+
+# Stray build/run logs (not source)
+*.log
+.logs/

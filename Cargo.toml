@@ -1,0 +1,55 @@
+[package]
+name = "depth-anything"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "A pure-Rust inference engine for Depth Anything 3, built on candle"
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "depth_anything"
+path = "src/lib.rs"
+
+[[example]]
+name = "da3"
+path = "examples/da3.rs"
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
+
+[[example]]
+name = "parity"
+path = "examples/parity.rs"
+
+[[example]]
+name = "parity_preproc"
+path = "examples/parity_preproc.rs"
+
+[[example]]
+name = "kquant_parity"
+path = "examples/kquant_parity.rs"
+
+[[example]]
+name = "ray_pose_parity"
+path = "examples/ray_pose_parity.rs"
+
+[dependencies]
+candle = { package = "candle-core", version = "0.8", default-features = false }
+candle-nn = { version = "0.8", default-features = false }
+half = { version = "2", features = ["num-traits"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+memmap2 = "0.9"
+rayon = "1.10"
+
+[features]
+default = []
+# Enable CUDA backend (requires CUDA toolkit at build time).
+cuda = ["candle/cuda", "candle-nn/cuda"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false

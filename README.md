@@ -8,6 +8,12 @@
 
 A from-scratch C++17/[ggml](https://github.com/ggml-org/ggml) port of [Depth Anything 3](https://github.com/bytedance-seed/depth-anything-3) (ByteDance) for **dependency-free monocular metric depth + camera pose** inference. One self-contained GGUF file, no Python, no PyTorch, no CUDA toolkit at inference, just a small native library and CLI, and now **faster than PyTorch on CPU**, bit-exact against the original.
 
+> **Rust port.** This repo also contains a from-scratch Rust/candle implementation
+> of the same forward pass under `src/*.rs`, with `cargo` build, an inference
+> CLI (`cargo run --example da3`), and a benchmark harness (`cargo run --example bench`).
+> See [`docs/RUST_PORT.md`](docs/RUST_PORT.md) for the status matrix, the
+> candle-vs-ggml comparison methodology, and what is/isn't ported.
+
 ![depth-anything.cpp vs PyTorch on CPU: same depth, ggml finishes first](benchmarks/media/depth_race.gif)
 
 > The same photo, depth computed side by side on CPU: identical output, depth-anything.cpp gets there first ([full clip](benchmarks/media/depth_race.mp4)).
@@ -99,6 +105,21 @@ cmake -B build -DDA_BUILD_CLI=ON
 cmake --build build -j
 # -> build/examples/cli/da3-cli
 ```
+
+### Rust port
+
+The Rust/candle port builds with `cargo` and reuses the same GGUF weights (no
+Python toolchain needed at inference):
+
+```sh
+cargo build --release --examples               # build the da3 + bench CLIs
+cargo run --release --example da3 -- info \
+    --model models/depth-anything-base-f32.gguf
+```
+
+CUDA: `cargo build --release --examples --features cuda` (needs the CUDA
+toolkit). See [`docs/RUST_PORT.md`](docs/RUST_PORT.md) for the full status matrix
+and the candle-vs-ggml benchmark methodology.
 
 ### CMake options
 
