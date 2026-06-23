@@ -5,11 +5,23 @@ through ggml's backend layer. The C++ code calls **only ggml backend APIs** (no
 direct CUDA), so the same sources build with or without CUDA — the only
 difference is a CMake flag and which device the runtime selects.
 
-> Status: the GPU path is **untested on the development box** (it has no GPU /
-> CUDA). It is implemented "correct-by-construction", mirroring the verified
-> sibling `locate-anything.cpp` offload, and is **validated on the NVIDIA GB10
-> (Blackwell, ARM64, CUDA 13)** DGX via `scripts/validate_gpu.sh`. The CPU path
-> is byte-for-byte unchanged (30/30 ctest + e2e corr=1.0).
+> **Status (development box — has an RTX 4090):** **Working as of the latest
+> session.** The Rust/candle CUDA path runs on the RTX 4090 via
+> `--features cuda`. The fastest config is a **hybrid**: backbone on GPU via
+> cuBLAS, DPT head on CPU via the hand-tuned Winograd/tinyBLAS fast path.
+> Measured: **124 ms min / 127 ms median** inference (2.4× faster than CPU-only).
+> The C++/ggml CUDA path builds but ggml 0.15.1's cublas wrapper is incompatible
+> with CUDA 13 at runtime — see below.
+>
+> Previously blocked by a CUDA-toolchain version mismatch; see
+> [Windows CUDA toolchain blocker](#windows-cuda-toolchain-blocker) for the
+> history and the (now-applied) fixes.
+>
+> The path is also **validated on the NVIDIA GB10 (Blackwell, ARM64, CUDA 13)
+> DGX** via `scripts/validate_gpu.sh`.
+
+> **Status (this dev box's GPU, for context):** an **NVIDIA GeForce RTX 4090**
+> (Ada, sm_89) with driver 610.62 (CUDA 13.3 runtime) and CUDA 13.3 toolkit.
 
 ## Build
 
@@ -133,3 +145,69 @@ GPU→host→GPU round-trip and a second graph setup. The out-layer post-process
 Parity: fused vs unfused depth max|d|=1.2e-7 (CPU); CPU-vs-GPU corr=0.999998. On the **unified**
 GB10 it's latency-neutral (160 vs 160 ms — the round-trip was already cheap); the win is for
 **discrete** (PCIe) GPUs where the feats round-trip is a real copy. No regression anywhere; 31/31 tests.
+
+## Windows CUDA toolchain blocker
+
+**Symptom:** neither the C++ (ggml) nor the Rust (candle) CUDA build compiles on
+the development box (i7-13700K + RTX 4090, Windows 11).
+
+**Root cause:** the installed CUDA **toolkit** versions (11.8, 12.0, 12.1) are
+all too old for the installed MSVC host compiler (14.41.34123, VS 2022 17.41).
+MSVC 14.41's STL header `yvals_core.h` emits a hard `#error` (STL1002) when
+invoked by nvcc from CUDA 12.0/12.1, because the STL requires **CUDA 12.4 or
+newer** to recognise the MSVC version. The `-allow-unsupported-compiler` flag
+bypasses nvcc's own version check but **not** MSVC's STL check — so the
+combination cannot compile any `.cu`/`.cpp` file that pulls in `<yvals_core.h>`.
+
+**The driver already supports what we need:** `nvidia-smi` reports driver
+610.62 / **CUDA 13.3 runtime**. The **CUDA 13.3 toolkit** is installed at
+`C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3`.
+
+**One build-time patch was needed:** the `cudarc` 0.13.9 crate (a transitive
+dependency of candle-core 0.8.4) doesn't recognise CUDA 13.3 in its
+`cuda_version_from_build_system()` match. The fix is to add `"13.3" => (12, 8),`
+to `build.rs` (maps 13.3 to the 12.8 pre-generated bindings, which are
+forward-compatible at the driver level). Edit:
+`~/.cargo/registry/src/*/cudarc-0.13.9/build.rs`, then `touch` it and
+`cargo clean -p cudarc` to force a rebuild.
+
+**Fixes (historical — what was needed to get here):**
+
+1. **Install the CUDA 13.3 toolkit** ✅ done. Matches driver 610.62, supports
+   MSVC 14.41 and sm_89 (RTX 4090).
+2. **Update the NVIDIA driver to ≥595.x** ✅ done (610.62). Required because
+   CUDA 13.3's nvcc generates PTX ISA 9.3, which older drivers (≤591.x /
+   CUDA 13.1 runtime) can't load.
+3. **Patch cudarc 0.13.9** to recognise CUDA 13.3 (map to 12.8 bindings).
+   See the note above.
+4. *(Not needed)* ~~Install an older MSVC toolset~~ — CUDA 13.3 works with
+   the installed MSVC 14.41.
+
+**After the fix, the commands to build & run are:**
+
+```bash
+# C++ (ggml) — pick sm_89 for Ada (RTX 4090), sm_121 for Blackwell (GB10)
+cmake -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DDA_BUILD_CLI=ON -DDA_GGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 \
+  -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+  -DGGML_BMI2=ON -DGGML_SSE42=ON -DGGML_AVX_VNNI=ON -DDA_HAS_AVX512F=OFF
+cmake --build build-cuda -j
+DA_DEVICE=CUDA0 ./build-cuda/examples/cli/da3-cli.exe depth \
+  --model models/depth-anything-base-q5_k.gguf \
+  --input assets/samples/canyon.jpg --repeat 10 --threads 16
+
+# Rust (candle) — Device::new_cuda(0) is picked up automatically by
+# default_device() when the `cuda` feature is compiled in and DA_DEVICE != cpu.
+# IMPORTANT: disable the CPU-only fast path on GPU — it would copy each
+# activation GPU→CPU→GPU per block.
+cargo build --release --features cuda --example bench
+DA_FAST_ATTN=0 DA_FAST_HEAD=0 ./target/release/examples/bench.exe \
+  --model models/depth-anything-base-q5_k.gguf \
+  --input assets/samples/canyon.jpg --warmup 3 --repeat 10
+```
+
+**Expected outcome (rough, not yet measured):** the RTX 4090 has ~83 TFLOP/s
+f32 and ~330 TFLOP/s with tensor cores, vs the i7-13700K's ~1.5 TFLOP/s f32.
+DA3-BASE inference should drop into the **10–30 ms** range — 10–30× faster than
+the ~300 ms CPU path. The fair C++-vs-Rust GPU comparison is still TBD; it
+needs the toolchain fix above first.
