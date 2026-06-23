@@ -13,6 +13,7 @@
 
 use crate::config::Config;
 use crate::Result;
+use rayon::prelude::*;
 
 /// An RGB image in HWC uint8 layout.
 #[derive(Debug, Clone)]
@@ -152,9 +153,11 @@ pub fn resize_cubic(src: &Image, dw: usize, dh: usize) -> Image {
         }
     }
 
-    // Horizontal pass: sh × dw × 3 float.
-    let mut tmp = vec![0.0f32; (sh as usize) * dw * 3];
-    for y in 0..sh as usize {
+    // Horizontal pass: sh × dw × 3 float. Parallelised over source rows — each
+    // row writes a disjoint slice of `tmp`, so no synchronisation is needed.
+    let sh_us = sh as usize;
+    let mut tmp = vec![0.0f32; sh_us * dw * 3];
+    tmp.par_chunks_mut(dw * 3).enumerate().for_each(|(y, row)| {
         for x in 0..dw {
             for c in 0..3 {
                 let mut acc = 0.0f32;
@@ -162,33 +165,38 @@ pub fn resize_cubic(src: &Image, dw: usize, dh: usize) -> Image {
                     let s = xidx[x * 4 + k] as usize;
                     acc += xwt[x * 4 + k] * src.px(y, s, c) as f32;
                 }
-                tmp[(y * dw + x) * 3 + c] = acc;
+                row[x * 3 + c] = acc;
             }
         }
-    }
+    });
 
-    // Vertical pass + saturate.
-    for y in 0..dh {
-        let fy = (y as f64 + 0.5) * sy - 0.5;
-        let iy = fy.floor() as i32;
-        let t = (fy - iy as f64) as f32;
-        let w = [
-            cubic_w(t + 1.0),
-            cubic_w(t),
-            cubic_w(t - 1.0),
-            cubic_w(t - 2.0),
-        ];
-        let yi: [i32; 4] = std::array::from_fn(|k| clamp_i(iy - 1 + k as i32, 0, sh - 1));
-        for x in 0..dw {
-            for c in 0..3 {
-                let mut acc = 0.0f32;
-                for k in 0..4 {
-                    acc += w[k] * tmp[(yi[k] as usize * dw + x) * 3 + c];
+    // Vertical pass + saturate. Parallelised over destination rows — each row
+    // writes a disjoint slice of `dst.rgb`.
+    dst.rgb
+        .par_chunks_mut(dw * 3)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let fy = (y as f64 + 0.5) * sy - 0.5;
+            let iy = fy.floor() as i32;
+            let t = (fy - iy as f64) as f32;
+            let w = [
+                cubic_w(t + 1.0),
+                cubic_w(t),
+                cubic_w(t - 1.0),
+                cubic_w(t - 2.0),
+            ];
+            let yi: [usize; 4] =
+                std::array::from_fn(|k| clamp_i(iy - 1 + k as i32, 0, sh - 1) as usize);
+            for x in 0..dw {
+                for c in 0..3 {
+                    let mut acc = 0.0f32;
+                    for k in 0..4 {
+                        acc += w[k] * tmp[(yi[k] * dw + x) * 3 + c];
+                    }
+                    row[x * 3 + c] = sat_u8(acc);
                 }
-                dst.rgb[(y * dw + x) * 3 + c] = sat_u8(acc);
             }
-        }
-    }
+        });
     dst
 }
 
@@ -251,24 +259,37 @@ pub fn resize_area(src: &Image, dw: usize, dh: usize) -> Image {
     let xtab = area_tab(sw, dw as i32);
     let ytab = area_tab(sh, dh as i32);
 
-    // Horizontal pass.
-    let mut tmp = vec![0.0f32; (sh as usize) * dw * 3];
-    for y in 0..sh as usize {
+    // Horizontal pass. Parallelised over source rows — each row writes a
+    // disjoint slice of `tmp`.
+    let sh_us = sh as usize;
+    let mut tmp = vec![0.0f32; sh_us * dw * 3];
+    tmp.par_chunks_mut(dw * 3).enumerate().for_each(|(y, row)| {
         for t in &xtab {
             for c in 0..3 {
-                tmp[(y * dw + t.di) * 3 + c] += t.alpha * src.px(y, t.si, c) as f32;
+                row[t.di * 3 + c] += t.alpha * src.px(y, t.si, c) as f32;
             }
         }
-    }
-    // Vertical pass.
-    let mut acc = vec![0.0f32; dh * dw * 3];
+    });
+
+    // Group vertical taps by destination row so we can parallelise over output
+    // rows (each row's accumulation is independent).
+    let mut ytaps_by_row: Vec<Vec<(usize, f32)>> = vec![Vec::new(); dh];
     for t in &ytab {
-        for x in 0..dw {
-            for c in 0..3 {
-                acc[(t.di * dw + x) * 3 + c] += t.alpha * tmp[(t.si * dw + x) * 3 + c];
+        ytaps_by_row[t.di].push((t.si, t.alpha));
+    }
+
+    // Vertical pass + saturate. Parallelised over destination rows.
+    let mut acc = vec![0.0f32; dh * dw * 3];
+    acc.par_chunks_mut(dw * 3).enumerate().for_each(|(y, row)| {
+        for (si, alpha) in &ytaps_by_row[y] {
+            let tmp_row = &tmp[si * dw * 3..(si + 1) * dw * 3];
+            for x in 0..dw {
+                for c in 0..3 {
+                    row[x * 3 + c] += alpha * tmp_row[x * 3 + c];
+                }
             }
         }
-    }
+    });
     let mut rgb = vec![0u8; dw * dh * 3];
     for i in 0..acc.len() {
         rgb[i] = sat_u8(acc[i]);
@@ -320,24 +341,28 @@ pub fn preprocess_real(img: &Image, cfg: &Config) -> Result<Preprocessed> {
     let upper = cfg.img_resize_mode != crate::config::ResizeMode::LowerBound;
     let (ow, oh) = (img.w as i32, img.h as i32);
 
-    let mut cur = img.clone();
-
     // Step 1: boundary resize (longest/shortest side -> target).
+    // Avoid cloning `img` unless we need to (i.e. no resize fires and we fall
+    // through to the CHW step using the original pixels). When a resize does
+    // fire it returns a fresh `Image`, so the clone would just be immediately
+    // dropped.
     let bound = if upper {
-        cur.w.max(cur.h) as i32
+        img.w.max(img.h) as i32
     } else {
-        cur.w.min(cur.h) as i32
+        img.w.min(img.h) as i32
     };
-    if bound != target {
+    let mut cur: Image = if bound != target {
         let scale = target as f64 / bound as f64;
-        let nw = (py_round(cur.w as f64 * scale)).max(1);
-        let nh = (py_round(cur.h as f64 * scale)).max(1);
-        cur = if scale > 1.0 {
-            resize_cubic(&cur, nw as usize, nh as usize)
+        let nw = (py_round(img.w as f64 * scale)).max(1);
+        let nh = (py_round(img.h as f64 * scale)).max(1);
+        if scale > 1.0 {
+            resize_cubic(img, nw as usize, nh as usize)
         } else {
-            resize_area(&cur, nw as usize, nh as usize)
-        };
-    }
+            resize_area(img, nw as usize, nh as usize)
+        }
+    } else {
+        img.clone()
+    };
 
     // Step 2: round each dim to a multiple of patch.
     let nw = (nearest_multiple(cur.w as i32, patch)).max(1);
@@ -353,14 +378,54 @@ pub fn preprocess_real(img: &Image, cfg: &Config) -> Result<Preprocessed> {
 
     let (h, w) = (cur.h, cur.w);
     let mut chw = vec![0.0f32; 3 * h * w];
-    for c in 0..3 {
-        for y in 0..h {
-            for x in 0..w {
-                let v = cur.rgb[(y * w + x) * 3 + c] as f32 / 255.0;
-                chw[(c * h + y) * w + x] = (v - cfg.img_mean[c]) / cfg.img_std[c];
+    // Precompute per-channel (mean, inv_std) to hoist the division out of the
+    // inner loop.
+    let mean = [cfg.img_mean[0], cfg.img_mean[1], cfg.img_mean[2]];
+    let inv_std = [
+        1.0 / cfg.img_std[0],
+        1.0 / cfg.img_std[1],
+        1.0 / cfg.img_std[2],
+    ];
+    // Parallelise over rows. For each output row, read the contiguous HWC
+    // triplets (1 cache line’s worth of input) and scatter into the 3 channel
+    // planes — so each input byte is read exactly once.
+    //
+    // `chw` is [C, H, W] row-major. The 3 channel planes are at offsets
+    // [0, h*w, 2*h*w]. Within each plane, row `y` is at offset `y*w`. We write
+    // each output row (w floats) from a distinct source row, so writes are
+    // disjoint across rayon tasks.
+    let plane = h * w; // floats per channel plane
+    let base = chw.as_mut_ptr() as usize;
+    let src_base = cur.rgb.as_ptr() as usize;
+    // Process rows in chunks of `ROW_CHUNK` to amortise rayon dispatch overhead
+    // (each row is only ~2 KiB of output, too small to justify its own task).
+    const ROW_CHUNK: usize = 16;
+    let n_chunks = h.div_ceil(ROW_CHUNK);
+    (0..n_chunks).into_par_iter().for_each(|chunk| {
+        let y_start = chunk * ROW_CHUNK;
+        let y_end = (y_start + ROW_CHUNK).min(h);
+        // SAFETY: each task writes 3 disjoint [(y_end-y_start)*w] slices at
+        //   offsets y_start*w, plane+y_start*w, 2*plane+y_start*w — all within
+        //   the `chw` allocation, and disjoint across tasks (different y ranges).
+        unsafe {
+            let base = base as *mut f32;
+            let src_base = src_base as *const u8;
+            for y in y_start..y_end {
+                let src = std::slice::from_raw_parts(src_base.add(y * w * 3), w * 3);
+                let r0 = std::slice::from_raw_parts_mut(base.add(y * w), w);
+                let r1 = std::slice::from_raw_parts_mut(base.add(plane + y * w), w);
+                let r2 = std::slice::from_raw_parts_mut(base.add(2 * plane + y * w), w);
+                for x in 0..w {
+                    let v0 = src[x * 3] as f32 / 255.0;
+                    let v1 = src[x * 3 + 1] as f32 / 255.0;
+                    let v2 = src[x * 3 + 2] as f32 / 255.0;
+                    r0[x] = (v0 - mean[0]) * inv_std[0];
+                    r1[x] = (v1 - mean[1]) * inv_std[1];
+                    r2[x] = (v2 - mean[2]) * inv_std[2];
+                }
             }
         }
-    }
+    });
     Ok(Preprocessed {
         h,
         w,
