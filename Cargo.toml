@@ -35,6 +35,18 @@ path = "examples/kquant_parity.rs"
 name = "ray_pose_parity"
 path = "examples/ray_pose_parity.rs"
 
+[[example]]
+name = "probe_hotspots"
+path = "examples/probe_hotspots.rs"
+
+[[example]]
+name = "tinyblas_bench"
+path = "examples/tinyblas_bench.rs"
+
+[[example]]
+name = "gelu_bench"
+path = "examples/gelu_bench.rs"
+
 [dependencies]
 candle = { package = "candle-core", version = "0.8", default-features = false }
 candle-nn = { version = "0.8", default-features = false }
@@ -53,3 +65,4 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 debug = false
+panic = "abort"

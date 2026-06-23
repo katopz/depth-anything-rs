@@ -66,6 +66,11 @@ pub struct VitBlock {
     pub norm2: LayerNorm,
     pub ffn: Ffn,
     pub ls2: Option<Tensor>,
+    /// Block-level LayerNorm epsilon (cached for the fast path).
+    ln_eps: f32,
+    /// Candle-free fast path (built lazily on first `forward` when
+    /// `DA_FAST_ATTN=1`). `Err` means construction failed; falls back to candle.
+    fast: std::sync::Mutex<Option<crate::fast_block::FastVitBlock>>,
 }
 
 impl VitBlock {
@@ -89,6 +94,8 @@ impl VitBlock {
             norm2,
             ffn,
             ls2,
+            ln_eps: cfg.ln_eps as f32,
+            fast: std::sync::Mutex::new(None),
         })
     }
 
@@ -100,7 +107,10 @@ impl VitBlock {
         cos: Option<&Tensor>,
         sin: Option<&Tensor>,
     ) -> Result<Tensor> {
-        // Attention sub-block.
+        if fast_attn_enabled() {
+            return self.forward_fast(x, cos, sin);
+        }
+        // Attention sub-block (candle path).
         let xn = self.norm1.forward(x)?;
         let a = self.attn.forward(&xn, cos, sin)?;
         let a = scale_layer(&a, &self.ls1)?;
@@ -113,6 +123,84 @@ impl VitBlock {
         let x = (x + m)?;
         Ok(x)
     }
+
+    /// Candle-free fast path: the entire block (norm1 + attn + ls1 + residual
+    /// + norm2 + ffn + ls2 + residual) runs on raw `&[f32]` via
+    /// [`crate::fast_block::FastVitBlock`], bypassing candle's per-op overhead.
+    /// Falls back to [`forward`] if batch != 1 or construction fails.
+    fn forward_fast(
+        &self,
+        x: &Tensor,
+        cos: Option<&Tensor>,
+        sin: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (b, n, _e) = x.dims3()?;
+        if b != 1 {
+            // Multi-batch isn't supported by the raw-f32 path; fall back.
+            return self.forward_candle(x, cos, sin);
+        }
+        let x_flat = x.flatten_all()?.to_vec1::<f32>()?;
+        let (c_v, s_v) = match (cos, sin) {
+            (Some(c), Some(s)) => (
+                Some(c.flatten_all()?.to_vec1::<f32>()?),
+                Some(s.flatten_all()?.to_vec1::<f32>()?),
+            ),
+            _ => (None, None),
+        };
+        let rope = match (&c_v, &s_v) {
+            (Some(c), Some(s)) => Some((c.as_slice(), s.as_slice())),
+            _ => None,
+        };
+
+        let embed = x.dim(2)? as usize;
+        let mut guard = self.fast.lock().expect("fast_block mutex poisoned");
+        if guard.is_none() {
+            *guard = crate::fast_block::FastVitBlock::from_candle(self, self.ln_eps).ok();
+        }
+        let Some(fast) = guard.as_mut() else {
+            return self.forward_candle(x, cos, sin);
+        };
+        // Reuse a single output buffer across calls (stored in the Mutex guard
+        // alongside the FastVitBlock — but since forward_into needs &mut self
+        // and we hold the guard, we allocate here and let the caller deal).
+        // For simplicity we allocate once per call; the block's internal scratch
+        // (the expensive part) is reused.
+        let mut out_buf = vec![0.0f32; n * embed];
+        fast.forward_into(&x_flat, &mut out_buf, n, rope);
+        Tensor::from_vec(out_buf, (1, n, embed), x.device()).map_err(Into::into)
+    }
+
+    /// The candle path (used as fallback or when fast path is disabled).
+    fn forward_candle(
+        &self,
+        x: &Tensor,
+        cos: Option<&Tensor>,
+        sin: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let xn = self.norm1.forward(x)?;
+        let a = self.attn.forward(&xn, cos, sin)?;
+        let a = scale_layer(&a, &self.ls1)?;
+        let x = (x + a)?;
+        let xn = self.norm2.forward(&x)?;
+        let m = self.ffn.forward(&xn)?;
+        let m = scale_layer(&m, &self.ls2)?;
+        let x = (x + m)?;
+        Ok(x)
+    }
+}
+
+/// Read `DA_FAST_ATTN` once and cache. When set to "1" (or "on"/"true"), the
+/// ViT block routes attention through [`Attention::forward_fast`] (the
+/// candle-free tinyBLAS path). Any other value (or unset) uses the candle path.
+fn fast_attn_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("DA_FAST_ATTN").as_deref(),
+            Ok("1") | Ok("on") | Ok("true") | Ok("ON") | Ok("TRUE") | Ok("True")
+        )
+    })
 }
 
 fn scale_layer(x: &Tensor, gamma: &Option<Tensor>) -> Result<Tensor> {

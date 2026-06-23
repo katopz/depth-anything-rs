@@ -166,5 +166,9 @@ fn run() -> depth_anything::Result<()> {
         stage(stage_sums.activate_ms),
     );
 
+    // If per-op profiling was enabled, dump the accumulated backbone/head
+    // breakdown to stderr.
+    depth_anything::fast_profile::dump_and_reset();
+
     Ok(())
 }

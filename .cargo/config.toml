@@ -1,0 +1,5 @@
+[build]
+# Target the host CPU so auto-vectorized loops (layernorm, softmax, gelu, rope,
+# gather/scatter) pick up AVX2/FMA, matching what the explicit `#[target_feature]`
+# kernels in tinyblas/fast_attn/fast_dpt already use.
+rustflags = ["-C", "target-cpu=native"]

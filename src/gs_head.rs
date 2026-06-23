@@ -368,7 +368,7 @@ fn add_uv(
     device: &Device,
 ) -> Result<Tensor> {
     let buf = uv_embed_chw_cached(w, h, c, aspect, UV_RATIO);
-    let pe = Tensor::from_vec(buf, (1, c, h, w), device)?.to_dtype(DType::F32)?;
+    let pe = Tensor::from_vec((*buf).clone(), (1, c, h, w), device)?.to_dtype(DType::F32)?;
     Ok(x.broadcast_add(&pe)?)
 }
 

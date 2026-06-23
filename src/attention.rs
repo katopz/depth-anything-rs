@@ -9,6 +9,7 @@ use crate::weights::load_linear;
 use crate::Result;
 use candle::{DType, Device, Tensor};
 use candle_nn::{layer_norm, LayerNorm, Linear, Module, VarBuilder};
+use std::sync::Mutex;
 
 /// Epsilon for the q/k LayerNorms. **Not** the block's `ln_eps` (1e-6) — this
 /// matches torch's default `nn.LayerNorm` eps, which DA3 uses for q/k norms.
@@ -28,6 +29,10 @@ pub struct Attention {
     pub k_norm: Option<LayerNorm>,
     pub num_heads: usize,
     pub head_dim: usize,
+    /// Candle-free fast path, built lazily on first `forward_fast` call.
+    /// `Err` means construction failed (e.g. non-CPU storage); `forward_fast`
+    /// then falls back to `forward` permanently for this attention.
+    fast: Mutex<Option<crate::fast_attn::FastAttention>>,
 }
 
 impl Attention {
@@ -47,6 +52,7 @@ impl Attention {
             k_norm,
             num_heads: h,
             head_dim: d,
+            fast: Mutex::new(None),
         })
     }
 
@@ -119,6 +125,55 @@ impl Attention {
         let attn = attn.transpose(1, 2)?.contiguous()?.reshape((b, n, embed))?;
         let out = self.proj.forward(&attn)?;
         Ok(out)
+    }
+
+    /// Candle-free fast path: same math as [`forward`], but runs entirely on
+    /// raw `&[f32]` buffers via [`crate::fast_attn::FastAttention`], bypassing
+    /// candle's per-op allocation and dispatcher overhead.
+    ///
+    /// The fast path is built lazily on first call (extracting + pre-packing
+    /// the candle weights once) and cached for the lifetime of this
+    /// `Attention`. Subsequent calls pay only the input/output tensor
+    /// marshalling.
+    ///
+    /// `x` must have batch dim 1 (`[1, N, embed]`), matching how the engine
+    /// always feeds attention. `cos`/`sin`, when both `Some`, must be
+    /// `[N, head_dim]` rope2d tables; `None` disables rope.
+    pub fn forward_fast(
+        &self,
+        x: &Tensor,
+        cos: Option<&Tensor>,
+        sin: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (b, n, _e) = x.dims3()?;
+        if b != 1 {
+            return self.forward(x, cos, sin);
+        }
+        // Extract x to a flat Vec<f32> before locking (keeps the critical
+        // section short, though blocks run serially in the backbone anyway).
+        let x_flat = x.flatten_all()?.to_vec1::<f32>()?;
+        let (c_v, s_v) = match (cos, sin) {
+            (Some(c), Some(s)) => (
+                Some(c.flatten_all()?.to_vec1::<f32>()?),
+                Some(s.flatten_all()?.to_vec1::<f32>()?),
+            ),
+            _ => (None, None),
+        };
+        let rope = match (&c_v, &s_v) {
+            (Some(c), Some(s)) => Some((c.as_slice(), s.as_slice())),
+            _ => None,
+        };
+
+        let mut guard = self.fast.lock().expect("fast_attn mutex poisoned");
+        if guard.is_none() {
+            *guard = crate::fast_attn::FastAttention::from_candle(self).ok();
+        }
+        let Some(fast) = guard.as_mut() else {
+            return self.forward(x, cos, sin);
+        };
+        let out = fast.forward(&x_flat, n, rope);
+        let embed = self.num_heads * self.head_dim;
+        Tensor::from_vec(out, (1, n, embed), x.device()).map_err(Into::into)
     }
 }
 

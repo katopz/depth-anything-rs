@@ -22,34 +22,38 @@ const HEAD_NORM_EPS: f32 = 1e-5;
 
 /// One DPT head, loaded from `head.*`.
 pub struct DptHead {
-    cfg: Config,
-    in_norm: Option<(Tensor, Tensor)>,
-    proj: [(Tensor, Tensor); 4],
-    resize0: (Tensor, Tensor),
-    resize1: (Tensor, Tensor),
-    resize3: (Tensor, Tensor),
-    layer_rn: [Tensor; 4],
-    rn1: Fusion,
-    rn2: Fusion,
-    rn3: Fusion,
-    rn4: Fusion,
-    out1: (Tensor, Tensor),
-    out2a: (Tensor, Tensor),
-    out2b: (Tensor, Tensor),
-    sky: Option<((Tensor, Tensor), (Tensor, Tensor))>,
+    pub(crate) cfg: Config,
+    pub(crate) in_norm: Option<(Tensor, Tensor)>,
+    pub(crate) proj: [(Tensor, Tensor); 4],
+    pub(crate) resize0: (Tensor, Tensor),
+    pub(crate) resize1: (Tensor, Tensor),
+    pub(crate) resize3: (Tensor, Tensor),
+    pub(crate) layer_rn: [Tensor; 4],
+    pub(crate) rn1: Fusion,
+    pub(crate) rn2: Fusion,
+    pub(crate) rn3: Fusion,
+    pub(crate) rn4: Fusion,
+    pub(crate) out1: (Tensor, Tensor),
+    pub(crate) out2a: (Tensor, Tensor),
+    pub(crate) out2b: (Tensor, Tensor),
+    pub(crate) sky: Option<((Tensor, Tensor), (Tensor, Tensor))>,
     /// Optional DualDPT auxiliary ray head (`head.scratch.*_aux`). Present only
     /// in `--with-aux` GGUFs. `None` => this model has no ray head.
-    aux: Option<AuxRayHead>,
+    #[allow(dead_code)]
+    pub(crate) aux: Option<AuxRayHead>,
+    /// Lazily-constructed candle-free head, used when `DA_FAST_HEAD=1`.
+    /// Wrapped in a `Mutex` so `forward` can stay `&self`.
+    fast: std::sync::OnceLock<crate::fast_dpt::FastDptHead>,
 }
 
 /// One `refinenet{N}` fusion stage.
-struct Fusion {
+pub(crate) struct Fusion {
     /// Lateral residual conv unit. `None` for refinenet4.
-    rc1: Option<((Tensor, Tensor), (Tensor, Tensor))>,
+    pub(crate) rc1: Option<((Tensor, Tensor), (Tensor, Tensor))>,
     /// Top residual conv unit (always present).
-    rc2: ((Tensor, Tensor), (Tensor, Tensor)),
+    pub(crate) rc2: ((Tensor, Tensor), (Tensor, Tensor)),
     /// 1×1 out conv (with bias), `feat_half → 128`.
-    outc: (Tensor, Tensor),
+    pub(crate) outc: (Tensor, Tensor),
 }
 
 /// The DualDPT auxiliary ray head — a fully independent fusion pyramid sharing
@@ -57,7 +61,8 @@ struct Fusion {
 /// channels-last LayerNorm, and a final 1×1 conv producing 7 channels
 /// (6 ray + 1 confidence). Matches `build_depth_graph`'s aux branch and
 /// `DptHead::rays` in `src/dpt_head.cpp`.
-struct AuxRayHead {
+#[allow(dead_code)]
+pub(crate) struct AuxRayHead {
     rn1: Fusion,
     rn2: Fusion,
     rn3: Fusion,
@@ -179,6 +184,7 @@ impl DptHead {
             out2b,
             sky,
             aux,
+            fast: std::sync::OnceLock::new(),
         })
     }
 
@@ -188,6 +194,59 @@ impl DptHead {
     /// the full processed image dims, used for the final bilinear upsample to
     /// full resolution (mirrors `interp_bilinear_ac(ctx, out, W, H)` in the C++).
     pub fn forward(
+        &self,
+        feats: &[Tensor],
+        gh: usize,
+        gw: usize,
+        h: usize,
+        w: usize,
+        device: &Device,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        // Fast path: candle-free DPT head.
+        if crate::fast_dpt::fast_dpt_enabled() {
+            return self.forward_fast(feats, gh, gw, h, w, device);
+        }
+        self.forward_candle(feats, gh, gw, h, w, device)
+    }
+
+    /// Candle-free forward (the `DA_FAST_HEAD=1` path).
+    fn forward_fast(
+        &self,
+        feats: &[Tensor],
+        gh: usize,
+        gw: usize,
+        h: usize,
+        w: usize,
+        device: &Device,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        use crate::fast_attn::flatten_to_f32;
+        // Lazily build the FastDptHead on first call. `get_or_try_init` is
+        // unstable, so we use `get_or_init` with a panicking closure. Errors
+        // here are unrecoverable (a weight failed to extract) and the panic
+        // message preserves the original error.
+        let fast = self.fast.get_or_init(|| {
+            crate::fast_dpt::FastDptHead::from_candle(self)
+                .expect("FastDptHead::from_candle failed")
+        });
+        // Flatten the 4 backbone feature tensors to Vec<f32>.
+        let feats_host: Vec<Vec<f32>> = feats
+            .iter()
+            .map(|t| flatten_to_f32(t))
+            .collect::<Result<Vec<_>>>()?;
+        let (out, sky) = fast.forward(&feats_host, gh, gw, h, w)?;
+        // Wrap the output back into a candle Tensor. The activation expects
+        // NCHW `[1, output_dim, H, W]` (channel-major flatten).
+        let oc = self.out2b.0.dim(0)?;
+        let logits = Tensor::from_vec(out, (1, oc, h, w), device)?;
+        let sky = match sky {
+            Some(v) => Some(Tensor::from_vec(v, (1, 1, h, w), device)?),
+            None => None,
+        };
+        Ok((logits, sky))
+    }
+
+    /// Candle-backed forward (the default / fallback path).
+    fn forward_candle(
         &self,
         feats: &[Tensor],
         gh: usize,
@@ -512,16 +571,109 @@ fn add_uv(
     device: &Device,
 ) -> Result<Tensor> {
     let buf = uv_embed_chw_cached(w, h, c, aspect, UV_RATIO);
-    let pe = Tensor::from_vec(buf, (1, c, h, w), device)?.to_dtype(DType::F32)?;
+    let pe = Tensor::from_vec((*buf).clone(), (1, c, h, w), device)?.to_dtype(DType::F32)?;
     Ok(x.broadcast_add(&pe)?)
 }
 
 /// Functional conv2d: build a throwaway `Conv2d` module from loaded weights
 /// and run one forward. (candle has no stateless functional conv2d op.)
+///
+/// When `DA_FAST_HEAD=1`, stride-1 3×3 (pad-1) and 1×1 (pad-0) convs are
+/// routed through [`crate::fast_conv`] (Winograd + tinyBLAS), bypassing
+/// candle's per-op overhead. Strided / transposed / grouped convs always use
+/// the candle path.
 fn conv_fwd(w: &Tensor, b: &Tensor, cfg: Conv2dConfig, x: &Tensor) -> Result<Tensor> {
+    if crate::fast_conv::fast_head_enabled() {
+        if let Some(out) = try_fast_conv(w, b, &cfg, x)? {
+            return Ok(out);
+        }
+    }
     Conv2d::new(w.clone(), Some(b.clone()), cfg)
         .forward(x)
         .map_err(Into::into)
+}
+
+/// Attempt the fast-conv path for stride-1 dilation-1 groups-1 N=1 convs.
+/// Returns `Ok(None)` when the conv config isn't supported (strided, grouped,
+/// non-3×3/1×1, etc.), signaling the caller to fall back to candle.
+fn try_fast_conv(w: &Tensor, b: &Tensor, cfg: &Conv2dConfig, x: &Tensor) -> Result<Option<Tensor>> {
+    use candle::{CpuStorage, Storage};
+    // Only handle stride=1, dilation=1, groups=1.
+    if cfg.stride != 1 || cfg.dilation != 1 || cfg.groups != 1 {
+        return Ok(None);
+    }
+    let x_dims = x.dims4().ok();
+    let w_dims = w.dims4().ok();
+    let (Some((n, ic, h, wid)), Some((oc, _w_ic, kh, kw))) = (x_dims, w_dims) else {
+        return Ok(None);
+    };
+    if n != 1 {
+        return Ok(None);
+    }
+    // Extract weight and bias as slices into the tensor storage (no copy).
+    // This keeps the storage pointer stable across forwards, which lets the
+    // fast_conv U-cache hit on every forward after the first.
+    let w_guard = w.storage_and_layout();
+    let w_data: &[f32] = match (&*w_guard.0, w_guard.1.contiguous_offsets()) {
+        (Storage::Cpu(CpuStorage::F32(d)), Some((o1, o2))) if w.dtype() == DType::F32 => &d[o1..o2],
+        _ => {
+            // Non-contiguous or non-f32 weight: fall back to candle.
+            return Ok(None);
+        }
+    };
+    let b_guard = b.storage_and_layout();
+    let b_data: &[f32] = match (&*b_guard.0, b_guard.1.contiguous_offsets()) {
+        (Storage::Cpu(CpuStorage::F32(d)), Some((o1, o2))) if b.dtype() == DType::F32 => &d[o1..o2],
+        _ => {
+            return Ok(None);
+        }
+    };
+    // Input always changes between convs, so copy it.
+    let x_data = tensor_to_vec_f32(x)?;
+
+    // Match the specific fast-conv variants.
+    let out = if kh == 3 && kw == 3 && cfg.padding == 1 {
+        crate::fast_conv::conv3x3_pad1(&x_data, w_data, b_data, n, ic, h, wid, oc)
+    } else if kh == 1 && kw == 1 && cfg.padding == 0 {
+        crate::fast_conv::conv1x1(&x_data, w_data, b_data, n, ic, h, wid, oc)
+    } else {
+        return Ok(None);
+    };
+    // Guards (w_guard, b_guard) dropped here, after the conv is done.
+    drop(w_guard);
+    drop(b_guard);
+    // For stride-1 pad-1 (3×3) and pad-0 (1×1), output spatial dims = input dims.
+    let device = x.device();
+    let out = Tensor::from_vec(out, (n, oc, h, wid), device)?;
+    Ok(Some(out))
+}
+
+/// Extract a `Vec<f32>` from a candle `Tensor`, using the zero-copy
+/// `storage_and_layout` path when the tensor is a contiguous CPU f32 buffer,
+/// and falling back to `flatten_all().to_vec1()` otherwise.
+///
+/// The zero-copy path still produces a `Vec<f32>` (the slice is copied into a
+/// new Vec), but it avoids the intermediate `contiguous()` + `to_dtype()` +
+/// `flatten_all()` chain that creates temporary tensors. For the common case
+/// (CPU f32, already contiguous), this is a single slice copy.
+fn tensor_to_vec_f32(t: &Tensor) -> Result<Vec<f32>> {
+    use candle::{CpuStorage, Storage};
+    // Fast path: contiguous CPU f32 tensor — extract slice directly from
+    // storage, avoiding the temporary tensors that `contiguous()` +
+    // `flatten_all()` + `to_vec1()` would create.
+    if t.dtype() == DType::F32 {
+        let (storage, layout) = t.storage_and_layout();
+        if let Storage::Cpu(CpuStorage::F32(data)) = &*storage {
+            if let Some((o1, o2)) = layout.contiguous_offsets() {
+                return Ok(data[o1..o2].to_vec());
+            }
+        }
+    }
+    // Fallback: convert dtype + make contiguous + flatten + copy.
+    Ok(t.to_dtype(DType::F32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<f32>()?)
 }
 
 /// Functional conv-transpose2d.

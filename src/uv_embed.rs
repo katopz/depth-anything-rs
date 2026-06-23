@@ -12,11 +12,11 @@
 //! resolution, so it is cached per `(W, H, C, aspect, ratio)`.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 type Key = (u32, u32, u32, u32, u32); // (W, H, C, aspect_bits, ratio_bits)
 
-static UV_CACHE: Mutex<Option<HashMap<Key, Vec<f32>>>> = Mutex::new(None);
+static UV_CACHE: Mutex<Option<HashMap<Key, Arc<Vec<f32>>>>> = Mutex::new(None);
 
 /// Compute the raw UV positional embedding for a `(pw, ph, C)` feature map,
 /// given the aspect ratio `aspect = W / H` of the **original image**.
@@ -88,10 +88,16 @@ pub fn uv_pos_embed(pw: usize, ph: usize, c: usize, aspect: f32) -> Vec<f32> {
 /// Cached, pre-scaled UV embedding laid out as `(C, H, W)` for direct use as
 /// a candle `[1, C, H, W]` input added to a feature map.
 ///
+/// Returns an `Arc<Vec<f32>>` so callers that only need `&[f32]` (e.g. the
+/// fast DPT head's parallel `+=` add) pay just an atomic increment instead of
+/// deep-copying what can be a 40+ MiB buffer at full resolution. Callers that
+/// require ownership (e.g. `Tensor::from_vec`) can call `(*arc).clone()` or
+/// `arc.to_vec()`.
+///
 /// `ratio` (the decoder's `× 0.1` scale) is folded into the cached buffer.
 /// Cache key includes the raw IEEE-754 bit patterns of `aspect` and `ratio`
 /// so equal floats collide exactly and NaN-keyed entries are impossible.
-pub fn uv_embed_chw_cached(w: usize, h: usize, c: usize, aspect: f32, ratio: f32) -> Vec<f32> {
+pub fn uv_embed_chw_cached(w: usize, h: usize, c: usize, aspect: f32, ratio: f32) -> Arc<Vec<f32>> {
     let key: Key = (
         w as u32,
         h as u32,
@@ -102,7 +108,7 @@ pub fn uv_embed_chw_cached(w: usize, h: usize, c: usize, aspect: f32, ratio: f32
     let mut guard = UV_CACHE.lock().unwrap();
     let map = guard.get_or_insert_with(HashMap::new);
     if let Some(v) = map.get(&key) {
-        return v.clone();
+        return Arc::clone(v);
     }
 
     // Raw embedding is (H, W, C). Transpose to (C, H, W) and scale by ratio.
@@ -115,8 +121,9 @@ pub fn uv_embed_chw_cached(w: usize, h: usize, c: usize, aspect: f32, ratio: f32
             }
         }
     }
-    map.insert(key, buf.clone());
-    buf
+    let arc = Arc::new(buf);
+    map.insert(key, Arc::clone(&arc));
+    arc
 }
 
 /// Clear the global UV-embed cache.
